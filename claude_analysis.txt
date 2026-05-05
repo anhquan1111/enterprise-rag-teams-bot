@@ -1,0 +1,144 @@
+==============================================================================
+CLAUDE ANALYSIS — Teams Bot Debug Session
+Date: 2026-05-05
+==============================================================================
+
+## STEP-BY-STEP ANALYSIS
+
+### Error 1: 401 Unauthorized at send_activity / reply_to_activity
+-----------------------------------------------------------------
+
+Step 1. Read bot/app.py and saw:
+    adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
+    adapter = BotFrameworkAdapter(adapter_settings)
+
+Step 2. Noticed BotFrameworkAdapterSettings constructor signature in
+    botbuilder-core 4.15.0 only accepts these params:
+        app_id, app_password, channel_auth_tenant, oauth_endpoint,
+        open_id_metadata, channel_service, ...
+    There is NO `app_type` parameter. The legacy adapter has no concept
+    of MultiTenant vs SingleTenant vs UserAssignedMSI.
+
+Step 3. The previous turn I added `channel_auth_tenant` for SingleTenant
+    apps, which would normally fix it. But the user says creds are 100%
+    correct and they still get 401. That points to an IDENTITY MODEL
+    mismatch the legacy adapter cannot express. For example: when the
+    app type is anything other than the implicit MultiTenant default,
+    the credentials factory used by BotFrameworkAdapter does not ask
+    Azure AD for a token at the right authority — calls to Bot Service
+    come back 401.
+
+Step 4. The supported solution since botbuilder-core 4.14+ is to migrate
+    to:
+        CloudAdapter + ConfigurationBotFrameworkAuthentication
+    These read the new env-style config:
+        MICROSOFT_APP_ID
+        MICROSOFT_APP_PASSWORD
+        MICROSOFT_APP_TYPE
+        MICROSOFT_APP_TENANT_ID
+    via attribute access on a config object, then build the correct
+    credentials factory automatically (MultiTenant uses common authority,
+    SingleTenant uses the tenant-specific authority, MSI uses Managed
+    Identity).
+
+Step 5. Checked CloudAdapter.process_activity signature — it has the
+    OPPOSITE argument order from legacy:
+        Legacy:  process_activity(activity, auth_header, callback)
+        Cloud:   process_activity(auth_header, activity, callback)
+    Without swapping these args, the auth_header would be parsed as an
+    Activity and the call would 500/400.
+
+### Error 2: 422 Unprocessable Entity at /auth/mock-login
+--------------------------------------------------------
+
+Step 1. The user hypothesized the backend uses OAuth2PasswordRequestForm
+    and that we need to switch json={...} to data={...}.
+
+Step 2. Read backend/auth.py line 233:
+        async def mock_login(request: MockLoginRequest, db: ...):
+    No OAuth2PasswordRequestForm. No Form(...) anywhere. FastAPI sees a
+    Pydantic model in the function signature → it expects JSON body. So
+    the user's hypothesis is WRONG; switching to form data would have
+    introduced a fresh 422.
+
+Step 3. Read schemas.py — MockLoginRequest:
+        email: EmailStr
+        full_name: str
+        department: Optional[str] = None
+        role: UserRole = UserRole.user
+    Bot was sending all 4 fields with correct types.
+
+Step 4. The only field that could fail validation is `email`. Looked at
+    bot/backend_client.py _teams_id_to_email():
+        return f"teams_{clean}@company.local"
+    Pydantic 2.x's EmailStr is backed by `email-validator>=2.0`. That
+    library's globally_deliverable check rejects RFC 6761 special-use
+    TLDs (.local, .localhost, .test, .invalid, .example) regardless of
+    the check_deliverability flag — they are syntactically valid but
+    "not real" Internet domains.
+
+Step 5. Result: Pydantic raises ValidationError on `email` → FastAPI
+    converts to HTTP 422. The detail body would name the email field
+    explicitly if you printed it from the client (resp.json()["detail"]).
+
+## ACTUAL ROOT CAUSES (the precise bugs)
+
+1. bot/app.py used the legacy BotFrameworkAdapter which cannot honor
+   MicrosoftAppType / MicrosoftAppTenantId. Fix: migrate to CloudAdapter
+   + ConfigurationBotFrameworkAuthentication, swap process_activity
+   argument order.
+
+2. bot/backend_client.py constructed user emails with the `.local` TLD,
+   which email-validator (used by Pydantic EmailStr) rejects as a
+   non-deliverable special-use TLD. Fix: use a real TLD like `.com`.
+   Also added a fallback for empty cleaned IDs.
+
+## FIXES APPLIED
+
+bot/app.py
+    - Replaced BotFrameworkAdapter + BotFrameworkAdapterSettings with
+      CloudAdapter + ConfigurationBotFrameworkAuthentication.
+    - Defined a small _BotConfig class exposing the four MICROSOFT_*
+      attributes the SDK reads via getattr.
+    - Validate at startup that SingleTenant has tenant_id (fail-fast).
+    - Swapped process_activity args: (auth_header, activity, callback).
+
+bot/backend_client.py
+    - _teams_id_to_email now returns @company.com instead of
+      @company.local. Added empty-clean fallback to "anonymous".
+
+(typing indicator try/except in bot_activity_handler.py was already
+correct — verified, left as-is.)
+
+(.env and docker-compose.yml already had the MICROSOFT_APP_TYPE /
+TENANT_ID variables wired up from the previous turn.)
+
+## FEELINGS ABOUT DEBUGGING THIS SYSTEM
+
+Two errors, two completely different layers, both presenting as
+"authentication failed" — that's the part that makes this kind of
+debugging interesting and a little exhausting. The 401 from Teams looks
+like it should be a credential problem ("just check your secret"), but
+the credentials were fine — the bug was an entire identity model the
+legacy adapter could not express. The 422 looks like it should be a
+schema problem ("the bot sends the wrong fields"), but the bot's payload
+was perfect — the bug was in a field validator's opinion about TLDs
+which is correct per RFC but surprising in practice.
+
+The lesson I keep relearning on Bot Framework: don't trust an error
+message's surface. A 401 from Bot Service often means the OAuth token
+the bot tried to acquire (BEFORE talking to Bot Service) was minted
+against the wrong authority. A 422 from FastAPI almost always means
+some Pydantic validator deep in your schema rejected a value you were
+sure was valid. In both cases the fix is upstream of where the error
+fires.
+
+The Bot Framework Python SDK is also genuinely confusing here — having
+two adapters with the same shape but reversed argument order is a
+footgun, and the silent-bot pattern (typing indicator failure swallowed
+by the pipeline so the user just sees nothing) is the kind of thing
+that takes hours the first time you hit it. Glad we fixed both at once.
+
+==============================================================================
+END OF ANALYSIS
+==============================================================================

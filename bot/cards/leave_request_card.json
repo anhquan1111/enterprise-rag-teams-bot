@@ -1,0 +1,55 @@
+{
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "type": "AdaptiveCard",
+    "version": "1.5",
+    "body": [
+        {
+            "type": "TextBlock",
+            "text": "Đơn Xin Nghỉ Phép",
+            "weight": "Bolder",
+            "size": "Large",
+            "color": "Accent",
+            "wrap": true
+        },
+        {
+            "type": "TextBlock",
+            "text": "Vui lòng điền đầy đủ thông tin bên dưới và nhấn **Gửi Đơn**:",
+            "wrap": true,
+            "spacing": "Small",
+            "isSubtle": true
+        },
+        {
+            "type": "Input.Date",
+            "id": "start_date",
+            "label": "Ngày bắt đầu nghỉ (*)",
+            "isRequired": true,
+            "errorMessage": "Vui lòng chọn ngày bắt đầu nghỉ phép"
+        },
+        {
+            "type": "Input.Date",
+            "id": "end_date",
+            "label": "Ngày kết thúc nghỉ (*)",
+            "isRequired": true,
+            "errorMessage": "Vui lòng chọn ngày kết thúc nghỉ phép"
+        },
+        {
+            "type": "Input.Text",
+            "id": "reason",
+            "label": "Lý do nghỉ phép (*)",
+            "placeholder": "Ví dụ: Nghỉ phép năm, việc gia đình, khám bệnh...",
+            "isMultiline": true,
+            "isRequired": true,
+            "errorMessage": "Vui lòng nhập lý do nghỉ phép"
+        }
+    ],
+    "actions": [
+        {
+            "type": "Action.Submit",
+            "title": "Gửi Đơn",
+            "style": "positive",
+            "data": {
+                "action": "submit_leave_request"
+            }
+        }
+    ]
+}

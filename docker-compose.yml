@@ -1,0 +1,326 @@
+# =============================================================================
+# DOCKER COMPOSE - HỆ THỐNG AI TRỢ LÝ HÀNH CHÍNH VĂN PHÒNG
+# PHASE 2: Thêm Backend FastAPI service
+#
+# Kiến trúc:
+#   Tầng 1 - Infrastructure & DBs:
+#     postgres    → Lưu dữ liệu quan hệ (Users, Sessions, LeaveRequests, Docs)
+#     redis       → Celery Broker + Semantic Cache
+#     chromadb    → Vector Database (lưu embeddings) [host:8001, internal:8000]
+#     ollama      → Local LLM (Qwen2.5-7B) - OpenAI-compatible API
+#     localrecall → RAG Engine (gọi Ollama để tìm kiếm ngữ nghĩa)
+#   Tầng 2 - Backend:
+#     backend     → FastAPI + Celery (Business Logic, CRUD, Auth)
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # POSTGRES 15 - Cơ sở dữ liệu quan hệ chính
+  # ===========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: qlda_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qlda_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qlda_secure_pass_2024}
+      POSTGRES_DB: ${POSTGRES_DB:-qlda_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - qlda_network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qlda_user} -d ${POSTGRES_DB:-qlda_db}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ===========================================================================
+  # REDIS 7 - Message Broker (Celery) + Semantic Cache
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: qlda_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - qlda_network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===========================================================================
+  # CHROMADB - Vector Database (lưu embeddings từ tài liệu)
+  # KHÔNG expose ra host — chỉ truy cập nội bộ qua Docker network:
+  #   chromadb:8000  (từ backend, celery_worker)
+  # ===========================================================================
+  chromadb:
+    # Pin tag để khớp major với client Python trong backend/requirements.txt.
+    # Tránh `latest` tự kéo bản mới làm vỡ compat (đã từng gây KeyError: '_type').
+    image: chromadb/chroma:latest
+    container_name: qlda_chromadb
+    restart: unless-stopped
+    environment:
+      CHROMA_SERVER_HOST: 0.0.0.0
+      CHROMA_SERVER_HTTP_PORT: 8000
+      ANONYMIZED_TELEMETRY: "false"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    networks:
+      - qlda_network
+    healthcheck:
+      test: [ "CMD", "bash", "-c", "echo > /dev/tcp/localhost/8000" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ===========================================================================
+  # OLLAMA - Local LLM Server (Qwen2.5-7B)
+  # Auto-pull model khi khởi động (skip nếu đã có trong volume)
+  # ===========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: qlda_ollama
+    restart: unless-stopped
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        echo '=== Ollama: Khởi động server... ==='
+        ollama serve &
+        OLLAMA_PID=$$!
+
+        echo '=== Ollama: Chờ server sẵn sàng... ==='
+        until ollama list > /dev/null 2>&1; do
+          echo '  [Chờ] Ollama chưa sẵn sàng, thử lại sau 3s...'
+          sleep 3
+        done
+        echo '=== Ollama: Server đã sẵn sàng! ==='
+
+        MODEL="${OLLAMA_MODEL:-qwen2.5:7b}"
+        if ollama list 2>/dev/null | grep -q "$$MODEL"; then
+          echo "=== Ollama: Model $$MODEL đã tồn tại, bỏ qua download. ==="
+        else
+          echo "=== Ollama: Đang pull model $$MODEL (có thể mất vài phút)... ==="
+          ollama pull "$$MODEL"
+          echo "=== Ollama: Pull model $$MODEL hoàn tất! ==="
+        fi
+
+        if ollama list 2>/dev/null | grep -q "nomic-embed-text"; then
+          echo "=== Ollama: nomic-embed-text đã tồn tại, bỏ qua download. ==="
+        else
+          echo "=== Ollama: Đang pull embedding model nomic-embed-text... ==="
+          ollama pull nomic-embed-text
+          echo "=== Ollama: Pull nomic-embed-text hoàn tất! ==="
+        fi
+
+        echo '=== Ollama: Sẵn sàng phục vụ requests. ==='
+        wait $$OLLAMA_PID
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    networks:
+      - qlda_network
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+    healthcheck:
+      test: [ "CMD-SHELL", "ollama list > /dev/null 2>&1 && exit 0 || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ===========================================================================
+  # LOCALRECALL - RAG Engine (mudler/LocalRecall)
+  # ===========================================================================
+  localrecall:
+    image: quay.io/mudler/localrecall:latest
+    container_name: qlda_localrecall
+    restart: unless-stopped
+    environment:
+      OPENAI_BASE_URL: "http://ollama:11434/v1"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-ollama-local-key}
+      MODEL: "qwen2.5:7b"
+      EMBEDDINGS_MODEL: "nomic-embed-text"
+      EMBEDDING_MODEL: "nomic-embed-text"
+      VECTOR_ENGINE: chromem
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-qlda_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qlda_secure_pass_2024}
+      POSTGRES_DB: ${POSTGRES_DB:-qlda_db}
+    volumes:
+      - localrecall_data:/app/data
+    ports:
+      - "${LOCALRECALL_PORT:-8080}:8080"
+    networks:
+      - qlda_network
+    depends_on:
+      ollama:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+
+  # ===========================================================================
+  # BACKEND - FastAPI + SQLAlchemy (Phase 2)
+  #
+  # Cấu hình:
+  #   - Build từ ./backend/Dockerfile
+  #   - Kết nối PostgreSQL (qlda_postgres:5432)
+  #   - Kết nối Redis (qlda_redis:6379)
+  #   - Mount source code để hỗ trợ hot-reload khi development
+  #   - Chờ postgres healthy trước khi khởi động
+  # ===========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: qlda_backend
+    restart: unless-stopped
+    env_file:
+      - .env # Load toàn bộ biến môi trường từ file .env gốc
+    environment:
+      # Override host names để trỏ đến Docker services (thay vì localhost)
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      OLLAMA_HOST: http://ollama:11434
+      LOCALRECALL_HOST: http://localrecall:8080
+      CHROMADB_HOST: chromadb # Internal Docker hostname — KHÔNG phải localhost
+      CHROMADB_PORT: "8000" # Internal port — giá trị này không expose ra host
+      UPLOAD_DIR: /app/uploads
+      APP_ENV: ${APP_ENV:-development}
+      DEBUG: ${DEBUG:-True}
+    volumes:
+      # Mount source code: thay đổi file → uvicorn tự reload (không cần build lại)
+      - ./backend:/app
+      # Volume chia sẻ với celery_worker để cả 2 service cùng đọc/ghi file upload
+      - uploads_data:/app/uploads
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    networks:
+      - qlda_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-sf", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ===========================================================================
+  # TEAMS BOT - Microsoft Teams Bot Framework Service (Phase 5)
+  #
+  # Cấu hình:
+  #   - Build từ ./bot/Dockerfile
+  #   - Lắng nghe webhook từ Azure Bot Service trên port 3978
+  #   - Kết nối Backend FastAPI qua Docker network: http://backend:8000
+  #   - MICROSOFT_APP_ID / PASSWORD: để trống khi dùng Bot Emulator (dev mode)
+  #   - Khi deploy lên Azure: điền APP_ID và PASSWORD từ Bot Registration
+  # ===========================================================================
+  teams_bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: qlda_teams_bot
+    restart: unless-stopped
+    environment:
+      MICROSOFT_APP_ID: ${MICROSOFT_APP_ID:-}
+      MICROSOFT_APP_PASSWORD: ${MICROSOFT_APP_PASSWORD:-}
+      MICROSOFT_APP_TYPE: ${MICROSOFT_APP_TYPE:-MultiTenant}
+      MICROSOFT_APP_TENANT_ID: ${MICROSOFT_APP_TENANT_ID:-}
+      BACKEND_API_URL: http://backend:8000
+      BOT_PORT: 3978
+    ports:
+      - "${BOT_PORT:-3978}:3978"
+    networks:
+      - qlda_network
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # Dùng Python (luôn có sẵn trong image) thay vì curl (không có trong slim)
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3978/health')" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ===========================================================================
+  # CELERY WORKER - Xử lý bất đồng bộ: Extract → Chunk → Push to LocalRecall
+  # Phase 3: Data Ingestion Pipeline
+  # ===========================================================================
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: qlda_celery_worker
+    restart: unless-stopped
+    # Override CMD của Dockerfile: chạy Celery worker thay vì uvicorn
+    command: celery -A celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
+    environment:
+      # Trỏ đến Docker service names (không phải localhost)
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      LOCALRECALL_HOST: http://localrecall:8080
+      CHROMADB_HOST: chromadb # Internal Docker hostname — KHÔNG phải localhost
+      CHROMADB_PORT: "8000" # Internal port — giá trị này không expose ra host
+      UPLOAD_DIR: /app/uploads
+      APP_ENV: ${APP_ENV:-development}
+      DEBUG: ${DEBUG:-True}
+    volumes:
+      # Cùng mount source code để dùng chung tasks.py, models.py, v.v.
+      - ./backend:/app
+      # Volume chia sẻ với backend để đọc file vừa upload
+      - uploads_data:/app/uploads
+    networks:
+      - qlda_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+# =============================================================================
+# VOLUMES - Persistent storage
+# =============================================================================
+volumes:
+  postgres_data:
+    name: qlda_postgres_data
+  redis_data:
+    name: qlda_redis_data
+  chromadb_data:
+    name: qlda_chromadb_data
+  ollama_data:
+    name: qlda_ollama_data
+  localrecall_data:
+    name: qlda_localrecall_data
+  uploads_data:
+    name: qlda_uploads_data # Chia sẻ file tạm giữa backend và celery_worker
+
+# =============================================================================
+# NETWORKS - Isolated bridge network
+# =============================================================================
+networks:
+  qlda_network:
+    name: qlda_network
+    driver: bridge

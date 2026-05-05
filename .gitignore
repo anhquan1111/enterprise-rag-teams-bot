@@ -1,0 +1,34 @@
+# Environment variables (chứa mật khẩu - KHÔNG commit)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Dữ liệu & Vector DB
+data/
+uploads/
+chroma_db/
+*.pdf
+*.docx
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker volumes (local dev data)
+data/

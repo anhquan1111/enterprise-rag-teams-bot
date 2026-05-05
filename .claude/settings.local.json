@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker --version)",
+      "Bash(docker-compose --version)",
+      "Bash(docker compose *)",
+      "Bash(docker exec *)",
+      "Bash(curl -s http://localhost:8000/api/v1/heartbeat)",
+      "Bash(curl -s http://localhost:8000/api/v2/heartbeat)",
+      "Bash(curl -s http://localhost:11434/api/tags)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(curl -s http://localhost:8080/)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -sf http://localhost:8000/docs)",
+      "Bash(curl *)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Total: {d[\\\\\"total\\\\\"]} docs'\\)\")",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:thamizhelango.medium.com)",
+      "WebFetch(domain:www.blog.brightcoding.dev)",
+      "Bash(docker run --rm qlda_code-teams_bot python -c ' *)",
+      "Bash(docker run *)"
+    ]
+  }
+}
