@@ -20,7 +20,13 @@
       "WebFetch(domain:thamizhelango.medium.com)",
       "WebFetch(domain:www.blog.brightcoding.dev)",
       "Bash(docker run --rm qlda_code-teams_bot python -c ' *)",
-      "Bash(docker run *)"
+      "Bash(docker run *)",
+      "Bash(cd /d D:\\\\Documents\\\\School\\\\Ki_6\\\\Quan_Ly_Du_An\\\\QLDA_Code)",
+      "Bash(Get-ChildItem -Path . -Recurse -Include docker-compose.yml, .env*, config.py, CLAUDE.md)",
+      "Bash(Select-Object FullName)",
+      "PowerShell(New-Item *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "PowerShell(Test-Path *)"
     ]
   }
 }

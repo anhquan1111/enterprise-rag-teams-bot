@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 # Import cấu hình và database
 from config import settings
@@ -77,6 +78,16 @@ async def lifespan(app: FastAPI):
     # Trong production nên dùng Alembic migrations thay vì create_all
     logger.info("Kiểm tra và tạo database tables...")
     Base.metadata.create_all(bind=engine)
+
+    # Migration shim: ADD COLUMN IF NOT EXISTS cho các DB đã tồn tại trước khi
+    # cột mới được merge. Postgres 9.6+ hỗ trợ IF NOT EXISTS → idempotent, chạy
+    # mỗi lần startup an toàn. Dùng tạm cho đến khi project di chuyển sang Alembic.
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE documents "
+            "ADD COLUMN IF NOT EXISTS localrecall_indexed BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+
     logger.info("Database tables đã sẵn sàng.")
     logger.info("API docs tại: http://localhost:8000/docs")
     logger.info("=" * 60)

@@ -143,7 +143,53 @@ services:
       start_period: 120s
 
   # ===========================================================================
-  # LOCALRECALL - RAG Engine (mudler/LocalRecall)
+  # LOCALRECALL_DB - Dedicated PostgreSQL 18 cho LocalRecall hybrid search.
+  #
+  # Build từ ./docker/localrecall_db (mirror Dockerfile chính thức của LocalRecall)
+  # vì image này cần 4 extension không có sẵn ở image upstream nào:
+  #   - pg_textsearch  (Timescale BM25, REQUIRED — chỉ build từ source, PG17/18)
+  #   - pgvector       (dense vector)
+  #   - pgvectorscale  (DiskANN — fast vector index, optional fallback)
+  #   - timescaledb    (preload required by vectorscale)
+  #
+  # First build mất ~10-15 phút (Rust compile cho pgvectorscale); sau đó cached.
+  # Tách hoàn toàn khỏi postgres chính (users/docs/auth) để bảo đảm an toàn dữ liệu.
+  # ===========================================================================
+  localrecall_db:
+    build:
+      context: ./docker/localrecall_db
+      dockerfile: Dockerfile.pgsql
+    image: qlda_localrecall_db:pg18
+    container_name: qlda_localrecall_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${LOCALRECALL_DB_USER:-localrecall}
+      POSTGRES_PASSWORD: ${LOCALRECALL_DB_PASSWORD:-localrecall_pass}
+      POSTGRES_DB: ${LOCALRECALL_DB_NAME:-localrecall_db}
+    volumes:
+      # Init script (CREATE EXTENSION pg_textsearch, vector, timescaledb, …)
+      # đã có sẵn TRONG image (copy bởi Dockerfile từ internal/init-db.sh).
+      # KHÔNG mount file ngoài vào /docker-entrypoint-initdb.d nữa — entrypoint
+      # tuỳ chỉnh chỉ chạy *.sh có execute bit, không tự pickup *.sql từ host.
+      - localrecall_db_data:/var/lib/postgresql/data
+    networks:
+      - qlda_network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${LOCALRECALL_DB_USER:-localrecall} -d ${LOCALRECALL_DB_NAME:-localrecall_db}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      # Startup dài vì shared_preload_libraries (timescaledb, pg_textsearch) +
+      # script tự initdb + create user/db lần đầu khi volume rỗng.
+      start_period: 60s
+
+  # ===========================================================================
+  # LOCALRECALL - RAG Engine (mudler/LocalRecall) — postgres engine + BM25 hybrid
+  #
+  # VECTOR_ENGINE=postgres bật hybrid search (BM25 keyword + vector cosine).
+  # HYBRID_SEARCH_BM25_WEIGHT cao hơn vì ChromaDB đã đảm nhiệm phần dense vector;
+  # LocalRecall chủ yếu đóng vai trò "exact keyword matcher" trong RRF fusion.
+  # MAX_CHUNKING_SIZE=4000 giảm số embedding LR phải gọi tuần tự (LR không batch).
   # ===========================================================================
   localrecall:
     image: quay.io/mudler/localrecall:latest
@@ -155,12 +201,20 @@ services:
       MODEL: "qwen2.5:7b"
       EMBEDDINGS_MODEL: "nomic-embed-text"
       EMBEDDING_MODEL: "nomic-embed-text"
-      VECTOR_ENGINE: chromem
-      POSTGRES_HOST: postgres
+      VECTOR_ENGINE: postgres
+      # Trỏ đến localrecall_db dedicated (KHÔNG dùng postgres chính)
+      POSTGRES_HOST: localrecall_db
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: ${POSTGRES_USER:-qlda_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qlda_secure_pass_2024}
-      POSTGRES_DB: ${POSTGRES_DB:-qlda_db}
+      POSTGRES_USER: ${LOCALRECALL_DB_USER:-localrecall}
+      POSTGRES_PASSWORD: ${LOCALRECALL_DB_PASSWORD:-localrecall_pass}
+      POSTGRES_DB: ${LOCALRECALL_DB_NAME:-localrecall_db}
+      DATABASE_URL: "postgres://${LOCALRECALL_DB_USER:-localrecall}:${LOCALRECALL_DB_PASSWORD:-localrecall_pass}@localrecall_db:5432/${LOCALRECALL_DB_NAME:-localrecall_db}?sslmode=disable"
+      # Hybrid search — favor BM25 (keyword) vì ChromaDB lo phần dense vector
+      HYBRID_SEARCH_BM25_WEIGHT: "0.6"
+      HYBRID_SEARCH_VECTOR_WEIGHT: "0.4"
+      # Chunk lớn hơn pipeline chính (2000) — BM25 không cần chunk nhỏ, giảm số embed sequential
+      MAX_CHUNKING_SIZE: "1000"
+      CHUNK_OVERLAP: "200"
     volumes:
       - localrecall_data:/app/data
     ports:
@@ -170,9 +224,7 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
-      chromadb:
+      localrecall_db:
         condition: service_healthy
 
   # ===========================================================================
@@ -314,6 +366,8 @@ volumes:
     name: qlda_ollama_data
   localrecall_data:
     name: qlda_localrecall_data
+  localrecall_db_data:
+    name: qlda_localrecall_db_data # Postgres+pgvector dedicated cho LocalRecall
   uploads_data:
     name: qlda_uploads_data # Chia sẻ file tạm giữa backend và celery_worker
 

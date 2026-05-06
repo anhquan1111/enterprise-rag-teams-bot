@@ -166,6 +166,7 @@ class DocumentResponse(ORMBase):
     chunk_count: Optional[int]
     error_message: Optional[str]
     uploaded_by: Optional[UUID]
+    localrecall_indexed: bool = False
 
     model_config = ConfigDict(
         from_attributes=True,
@@ -180,6 +181,7 @@ class DocumentResponse(ORMBase):
                 "chunk_count": None,
                 "error_message": None,
                 "uploaded_by": "550e8400-e29b-41d4-a716-446655440000",
+                "localrecall_indexed": False,
             }
         }
     )

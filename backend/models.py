@@ -180,6 +180,13 @@ class Document(Base):
         nullable=True,
         comment="ID user đã upload tài liệu này",
     )
+    localrecall_indexed = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        comment="True khi LocalRecall (BM25 keyword) đã index xong; False = chỉ ChromaDB",
+    )
 
     # --- Relationships ---
     uploader = relationship("User", back_populates="documents", foreign_keys=[uploaded_by])
