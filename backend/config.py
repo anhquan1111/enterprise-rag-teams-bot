@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     # --- Ollama ---
     OLLAMA_HOST: str = "http://ollama:11434"
     OLLAMA_MODEL: str = "qwen2.5:7b"
+    # Context window: Ollama mặc định chỉ 2048 tokens — quá nhỏ cho prompt RAG
+    # (system + 3 chunks × ~600 token + 6 history messages + question). Đặt 8192
+    # đủ chỗ cho prompt 4–6 KB ký tự tiếng Việt mà KHÔNG truncate đầu prompt.
+    # qwen2.5:7b hỗ trợ tới 128K tokens; 8192 vẫn rất an toàn về RAM (~6GB extra).
+    OLLAMA_NUM_CTX: int = 8192
+    # HTTP timeout cho call /api/generate. Cold-start qwen2.5:7b mất 20–40s,
+    # generation với num_ctx=8192 + prompt dài có thể mất 90–150s. 180s an toàn.
+    OLLAMA_GENERATE_TIMEOUT: float = 180.0
 
     # --- LocalRecall (kept for search compatibility) ---
     LOCALRECALL_HOST: str = "http://localrecall:8080"

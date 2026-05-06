@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
@@ -44,6 +45,91 @@ _RETRIEVAL_TOP_K = 10           # Số chunks lấy từ MỖI engine (Chroma + 
 _RRF_TOP_N = 5                  # Số chunks sau merge — đưa vào prompt builder
 _RRF_K = 60                     # Hằng số RRF chuẩn (Cormack 2009)
 _LR_SEARCH_TIMEOUT = 15.0       # LR chậm > 15s → degrade về Chroma-only
+
+# Số chunks tối đa đưa thẳng vào prompt. Nâng từ 3 lên 5 vì num_ctx=8192 đã
+# đủ chỗ; nhiều chunks hơn = ít rủi ro miss answer khi #1 là TOC noise.
+_PROMPT_CONTEXT_CHUNKS = 5
+
+# Ngưỡng phát hiện chunk "table of contents" (dotted-leader noise).
+# Trang mục lục thường có format: "Điều 6. ... ............ 8" nên >20% ký tự
+# là dots → BM25 vẫn match keyword nhưng nội dung KHÔNG có thông tin gì.
+# Chunks loại này ép xuống cuối ranking (vẫn giữ làm fallback nếu KHÔNG có gì khác).
+_TOC_DOT_RATIO_THRESHOLD = 0.20
+# Ngoài tỉ lệ dot, một dấu hiệu mạnh khác: chunk chứa nhiều "Điều N." liên tiếp
+# (3+ heading) mà không có câu mô tả dài — đó chắc chắn là TOC.
+_TOC_HEADING_COUNT_THRESHOLD = 3
+
+
+# =============================================================================
+# HELPER: Phát hiện và loại "table of contents" / heading-only chunks
+# =============================================================================
+
+# Pattern bắt heading kiểu "Điều N." hoặc "Chương N" / "CHƯƠNG N" — Vietnamese
+# legal document boilerplate. Dùng để đếm số heading trong 1 chunk.
+_HEADING_PATTERN = re.compile(
+    r"(?:Điều\s+\d+|CHƯƠNG\s+[IVX\d]+|Chương\s+[IVX\d]+|Mục\s+\d+)",
+    re.IGNORECASE,
+)
+
+
+def _is_toc_chunk(text: str) -> bool:
+    """
+    Trả True nếu chunk có dấu hiệu là trang mục lục (TOC) hoặc heading list.
+
+    Hai dấu hiệu (cần CẢ HAI để chắc chắn — tránh false positive với chunk
+    có 1-2 dấu chấm câu dài):
+      1. Tỉ lệ ký tự '.' > _TOC_DOT_RATIO_THRESHOLD (dotted-leader noise)
+         HOẶC chunk có ≥ _TOC_HEADING_COUNT_THRESHOLD heading "Điều N." liên tiếp.
+      2. Density văn bản thấp — alphanumeric chars / total < 0.5 (TOC nhiều dots,
+         spaces, page numbers chứ không có câu hoàn chỉnh).
+
+    Vì sao filter: BM25 match TOC chunk có score cao nhất do TOC chứa keyword
+    của câu hỏi (heading có cùng từ với question) — nhưng nội dung TOC chỉ là
+    "Điều X. Tiêu đề ... trang Y", KHÔNG có câu trả lời. LLM nhận chunk này
+    và đúng đắn báo "không tìm thấy thông tin" vì context thật sự rỗng.
+    """
+    if not text or len(text) < 50:
+        return False
+
+    total = len(text)
+    dot_count = text.count(".")
+    dot_ratio = dot_count / total
+    heading_count = len(_HEADING_PATTERN.findall(text))
+
+    # Dấu hiệu 1: dotted-leader OR multi-heading list
+    looks_like_toc_structure = (
+        dot_ratio > _TOC_DOT_RATIO_THRESHOLD
+        or heading_count >= _TOC_HEADING_COUNT_THRESHOLD
+    )
+    if not looks_like_toc_structure:
+        return False
+
+    # Dấu hiệu 2: alphanumeric density thấp (TOC = nhiều dots/spaces/digits)
+    alnum = sum(1 for c in text if c.isalnum())
+    alnum_ratio = alnum / total
+    return alnum_ratio < 0.5
+
+
+def _filter_low_quality(chunks: list[dict]) -> list[dict]:
+    """
+    Loại bỏ chunks là TOC/heading-list. Trả về list mới, GIỮ NGUYÊN thứ tự rank.
+
+    Edge case: nếu TẤT CẢ chunks đều bị filter (vd. user search "mục lục"),
+    trả LẠI list gốc — thà có TOC còn hơn rỗng tay (LLM tự xử lý).
+    """
+    filtered = [c for c in chunks if not _is_toc_chunk(c.get("text", ""))]
+    if not filtered and chunks:
+        logger.warning(
+            "Tất cả %d chunks là TOC/low-quality — fallback giữ nguyên list gốc.",
+            len(chunks),
+        )
+        return chunks
+    if len(filtered) < len(chunks):
+        logger.info(
+            "Filtered %d/%d TOC chunks (giữ %d).",
+            len(chunks) - len(filtered), len(chunks), len(filtered),
+        )
+    return filtered
 
 
 # =============================================================================
@@ -181,6 +267,17 @@ async def _search_localrecall(query: str, top_k: int = _RETRIEVAL_TOP_K) -> list
         return []
 
     # --- 2. HTTP status — non-2xx phải log status code + body chính xác ---
+    # 404 "collection không tồn tại" KHÔNG phải lỗi thật — đó là trạng thái bình
+    # thường khi seed_data.py chưa chạy hoặc vol vừa bị wipe. Log WARNING (không
+    # phải ERROR) để không gây hiểu lầm là bug. Mọi status >= 400 khác vẫn ERROR.
+    if resp.status_code == 404:
+        logger.warning(
+            "LocalRecall collection '%s' chưa tồn tại (HTTP 404). "
+            "Hybrid search sẽ degrade về ChromaDB-only. "
+            "Chạy `python seed_data.py` để ingest tài liệu.",
+            settings.LOCALRECALL_COLLECTION,
+        )
+        return []
     if resp.status_code >= 400:
         body_preview = (resp.text or "")[:1500]
         logger.error(
@@ -344,26 +441,44 @@ def _build_rag_prompt(
     Ghép system instruction + tài liệu RAG + lịch sử hội thoại + câu hỏi.
 
     Args:
-        context_chunks: Tối đa 3 đoạn tài liệu liên quan từ LocalRecall.
+        context_chunks: Các đoạn tài liệu đã được retrieve + filter TOC + RRF merge.
+                        Caller PHẢI truyền đúng số chunks muốn đưa vào prompt
+                        (hàm này KHÔNG truncate thêm — tránh override _PROMPT_CONTEXT_CHUNKS).
         question:       Câu hỏi hiện tại của người dùng.
         history:        Lịch sử hội thoại từ ChatSession.context_json.
+
+    Tinh chỉnh prompt (lý do từ chối hồi quy quá nhiều "không tìm thấy"):
+      - KHÔNG còn câu mẫu refusal cứng — trước đây hard-code "Tôi không tìm thấy
+        thông tin này trong tài liệu nội bộ" khiến LLM học theo và lặp lại kể cả
+        khi context có câu trả lời gián tiếp.
+      - Hướng dẫn LLM tổng hợp thông tin từ NHIỀU đoạn, dùng tài liệu gần đúng
+        để trả lời một phần, và CHỈ từ chối khi context thực sự trống về chủ đề.
+      - Cho phép trích dẫn nguyên văn ("Theo Điều X, ...") để tăng độ chính xác.
     """
     system_part = (
-        "Bạn là trợ lý hành chính AI của văn phòng. "
-        "Nhiệm vụ của bạn là trả lời câu hỏi của nhân viên dựa trên tài liệu nội bộ. "
-        "Hãy trả lời ngắn gọn, chính xác và lịch sự bằng tiếng Việt."
+        "Bạn là trợ lý hành chính AI của văn phòng, chuyên giải đáp các câu hỏi "
+        "về quy chế nội bộ, chính sách nhân sự và quy trình hành chính. "
+        "Trả lời bằng tiếng Việt, rõ ràng, đầy đủ và lịch sự."
     )
 
     if context_chunks:
         formatted = "\n\n---\n\n".join(
             f"[Tài liệu {i + 1}]:\n{chunk}"
-            for i, chunk in enumerate(context_chunks[:3])
+            for i, chunk in enumerate(context_chunks)
         )
         context_part = (
             f"\n\n[Tài liệu nội bộ liên quan]:\n{formatted}\n\n"
-            "Dựa vào các tài liệu trên, hãy trả lời câu hỏi một cách chính xác. "
-            "Nếu tài liệu không chứa thông tin liên quan, hãy nói: "
-            "'Tôi không tìm thấy thông tin này trong tài liệu nội bộ.'"
+            "[Hướng dẫn trả lời]:\n"
+            "1. ĐỌC KỸ TẤT CẢ các đoạn tài liệu ở trên trước khi trả lời. "
+            "Thông tin có thể nằm rải rác ở nhiều đoạn — hãy tổng hợp lại.\n"
+            "2. Trích dẫn cụ thể điều/khoản/mục khi có (ví dụ: \"Theo Điều 6, ...\").\n"
+            "3. Nếu các đoạn chỉ chứa thông tin một phần, hãy trả lời phần biết "
+            "được và nêu rõ phần nào chưa đủ chi tiết — KHÔNG từ chối hoàn toàn.\n"
+            "4. Nếu một đoạn trông giống mục lục (nhiều dấu chấm '...' và số trang) "
+            "thì BỎ QUA đoạn đó và dựa vào các đoạn còn lại có nội dung thực.\n"
+            "5. Chỉ khi TẤT CẢ các đoạn đều không liên quan đến chủ đề câu hỏi "
+            "thì mới nói rõ là tài liệu nội bộ chưa đề cập và gợi ý liên hệ phòng "
+            "ban phụ trách. KHÔNG đoán/bịa thông tin ngoài tài liệu."
         )
     else:
         context_part = (
@@ -399,9 +514,20 @@ async def _stream_ollama(prompt: str):
     Async generator: gọi Ollama /api/generate với stream=True,
     yield từng token text nhận được.
 
+    Tham số quan trọng:
+        - num_ctx: KÍCH THƯỚC CONTEXT WINDOW. Ollama mặc định 2048 tokens,
+          không đủ cho prompt RAG ~4-6 KB tiếng Việt → bị truncate đầu prompt
+          (mất system instruction hoặc tài liệu) → trả lời sai/lỗi.
+          Set 8192 từ settings.OLLAMA_NUM_CTX.
+        - timeout: dùng httpx.Timeout với read=settings.OLLAMA_GENERATE_TIMEOUT
+          (180s) — read timeout áp cho TỪNG chunk SSE, không phải tổng response.
+          Cold-start qwen2.5:7b 20–40s + first-token latency với prompt dài
+          có thể vượt 60s → cần ≥120s để tránh ReadTimeout giả.
+
     Raises:
         httpx.ConnectError: Không kết nối được Ollama.
         httpx.HTTPStatusError: Ollama trả về lỗi HTTP.
+        httpx.ReadTimeout: Ollama không phản hồi trong timeout (cực hiếm với 180s).
     """
     url = f"{settings.OLLAMA_HOST}/api/generate"
     payload = {
@@ -411,10 +537,22 @@ async def _stream_ollama(prompt: str):
         "options": {
             "temperature": 0.7,
             "top_p": 0.9,
+            "num_ctx": settings.OLLAMA_NUM_CTX,
         },
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    # httpx.Timeout phân biệt 4 pha: connect / read / write / pool.
+    # connect=10s đủ cho Docker DNS; read là pha quan trọng (chờ token tiếp theo)
+    # → set theo OLLAMA_GENERATE_TIMEOUT. Nếu chỉ pass số float vào timeout=,
+    # httpx áp CÙNG giá trị cho cả 4 pha — vẫn hoạt động nhưng kém rõ ràng.
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=settings.OLLAMA_GENERATE_TIMEOUT,
+        write=10.0,
+        pool=10.0,
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, json=payload) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -536,14 +674,22 @@ async def chat(
         _search_chromadb(request.message, top_k=_RETRIEVAL_TOP_K),
         _search_localrecall(request.message, top_k=_RETRIEVAL_TOP_K),
     )
-    context_chunks = _rrf_merge([chroma_results, lr_results], top_n=_RRF_TOP_N)
+    # Loại TOC/heading-only chunks TRƯỚC RRF — nếu không, BM25 score cao của TOC
+    # sẽ thắng RRF rank-fusion và chiếm slot top-N, đẩy nội dung thật ra ngoài.
+    chroma_clean = _filter_low_quality(chroma_results)
+    lr_clean = _filter_low_quality(lr_results)
+    context_chunks = _rrf_merge([chroma_clean, lr_clean], top_n=_RRF_TOP_N)
     logger.info(
-        "Hybrid retrieval: chroma=%d, localrecall=%d → RRF merged top %d.",
-        len(chroma_results), len(lr_results), len(context_chunks),
+        "Hybrid retrieval: chroma=%d→%d, localrecall=%d→%d → RRF merged top %d.",
+        len(chroma_results), len(chroma_clean),
+        len(lr_results), len(lr_clean), len(context_chunks),
     )
 
     # --- 3. Xây dựng RAG Prompt ---
-    prompt = _build_rag_prompt(context_chunks[:3], request.message, existing_history)
+    # num_ctx=8192 đủ chỗ cho 5 chunks (~600 chars/chunk) + history + question.
+    prompt = _build_rag_prompt(
+        context_chunks[:_PROMPT_CONTEXT_CHUNKS], request.message, existing_history,
+    )
     logger.debug("Prompt xây dựng xong, độ dài: %d ký tự", len(prompt))
 
     # --- 4. Stream từ Ollama + lưu DB ---
@@ -562,13 +708,23 @@ async def chat(
             accumulated.append(f"[Lỗi: {err}]")
             yield f"data: {json.dumps({'error': err})}\n\n"
 
+        except httpx.ReadTimeout:
+            # Hết read timeout giữa các chunk (model treo hoặc OOM khi load num_ctx lớn).
+            err = (
+                f"Ollama phản hồi quá chậm (>{settings.OLLAMA_GENERATE_TIMEOUT:.0f}s). "
+                "Có thể do prompt quá dài hoặc model chưa load xong. Vui lòng thử lại."
+            )
+            logger.error("Ollama ReadTimeout sau %.1fs", settings.OLLAMA_GENERATE_TIMEOUT)
+            accumulated.append(f"[Lỗi: {err}]")
+            yield f"data: {json.dumps({'error': err})}\n\n"
+
         except httpx.HTTPStatusError as e:
             err = f"Ollama trả về lỗi HTTP {e.response.status_code}."
             accumulated.append(f"[Lỗi: {err}]")
             yield f"data: {json.dumps({'error': err})}\n\n"
 
         except Exception as e:
-            logger.error("Lỗi không xác định khi stream Ollama: %s", str(e))
+            logger.error("Lỗi không xác định khi stream Ollama: %s", str(e), exc_info=True)
             err = "Lỗi hệ thống. Vui lòng thử lại."
             accumulated.append(f"[Lỗi: {err}]")
             yield f"data: {json.dumps({'error': err})}\n\n"

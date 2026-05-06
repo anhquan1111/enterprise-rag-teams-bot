@@ -26,7 +26,8 @@
       "Bash(Select-Object FullName)",
       "PowerShell(New-Item *)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "PowerShell(Test-Path *)"
+      "PowerShell(Test-Path *)",
+      "Bash(powershell *)"
     ]
   }
 }
